@@ -213,6 +213,303 @@ table.data th{color:var(--silver);font-size:.85rem;text-transform:uppercase;lett
      header = emblem for nav/footer (348x120 webp) | full = emblem + wordmark for hero (1000px webp)
      To replace the logo later, swap these two data URIs and the three <link rel="icon"> tags in <head>.
      ===================================================================== -->
+<!-- Windows app sources (plain text, never executed by the page; turned into downloads by the Downloads page) -->
+<script type="text/plain" id="ps-common">
+$ErrorActionPreference = 'Stop'
+$NF_VER = '1.0.0'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+try { $Host.UI.RawUI.WindowTitle = $NF_NAME } catch {}
+$script:Dir = Join-Path $env:APPDATA 'NovaFrame'
+New-Item -ItemType Directory -Force -Path $script:Dir | Out-Null
+$script:Licensed = $false
+$script:LicFile = Join-Path $script:Dir ($NF_APP + '_license.json')
+
+function NF-IsAdmin {
+  return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function NF-Elevate {
+  if ($env:NF_SELF -and (Test-Path $env:NF_SELF)) { Start-Process -FilePath $env:NF_SELF -Verb RunAs; exit }
+  Write-Host 'Close this window, then right-click the file and choose Run as administrator.' -ForegroundColor Yellow
+}
+function NF-DeviceId {
+  $f = Join-Path $script:Dir 'device.id'
+  if (Test-Path $f) { $v = (Get-Content $f -Raw).Trim(); if ($v -match '^[0-9a-f-]{36}$') { return $v } }
+  $id = [guid]::NewGuid().ToString()
+  Set-Content -Path $f -Value $id -Encoding ASCII
+  return $id
+}
+function NF-Rpc($name, $body) {
+  try {
+    $h = @{ apikey = $NF_KEY; Authorization = ('Bearer ' + $NF_KEY) }
+    $r = Invoke-RestMethod -Method Post -Uri ($NF_URL + '/rest/v1/rpc/' + $name) -Headers $h -ContentType 'application/json' -Body ($body | ConvertTo-Json -Compress) -TimeoutSec 10
+    return @{ ok = $true; data = $r }
+  } catch {
+    $offline = -not $_.Exception.Response
+    return @{ ok = $false; offline = $offline; error = $_.Exception.Message }
+  }
+}
+function NF-CheckLicense($raw) {
+  $x = ([string]$raw).ToUpper() -replace '[^A-F0-9]', ''
+  if ($x.Length -ne 20) { return @{ valid = $false; reason = 'bad_format' } }
+  $key = $x -replace '(.{4})(?=.)', '$1-'
+  $r = NF-Rpc 'nfa_license_check' @{ p_app = $NF_APP; p_key = $key; p_device = (NF-DeviceId) }
+  if ($r.ok) {
+    $d = $r.data
+    if ($d.valid) {
+      (@{ key = $key; lastOk = (Get-Date).ToString('o') } | ConvertTo-Json -Compress) | Set-Content -Path $script:LicFile -Encoding ASCII
+      return @{ valid = $true }
+    }
+    return @{ valid = $false; reason = [string]$d.reason }
+  }
+  if ($r.offline -and (Test-Path $script:LicFile)) {
+    try {
+      $s = Get-Content $script:LicFile -Raw | ConvertFrom-Json
+      if ($s.key -eq $key -and ((Get-Date) - [datetime]$s.lastOk).TotalDays -lt 7) { return @{ valid = $true; offline = $true } }
+    } catch {}
+  }
+  return @{ valid = $false; reason = 'offline' }
+}
+function NF-ReasonText($r) {
+  switch ($r) {
+    'bad_format'      { return 'That does not look like a license key (XXXX-XXXX-XXXX-XXXX-XXXX).' }
+    'invalid_key'     { return 'That key was not found for this app.' }
+    'revoked'         { return 'That key was replaced. Get your current key from the website.' }
+    'no_subscription' { return 'Your subscription for this app is not active.' }
+    'device_limit'    { return 'This key is already used on the maximum number of devices. Reset devices on the website.' }
+    'offline'         { return 'Cannot reach the license server. Check your internet connection.' }
+    default           { return 'The license could not be checked.' }
+  }
+}
+function NF-Startup {
+  if (Test-Path $script:LicFile) {
+    try { $s = Get-Content $script:LicFile -Raw | ConvertFrom-Json; $r = NF-CheckLicense $s.key; $script:Licensed = [bool]$r.valid } catch {}
+  }
+}
+function NF-Activate {
+  $k = Read-Host 'Enter your license key (XXXX-XXXX-XXXX-XXXX-XXXX)'
+  if (-not $k) { return }
+  $r = NF-CheckLicense $k
+  if ($r.valid) { $script:Licensed = $true; Write-Host 'License activated.' -ForegroundColor Green }
+  else { Write-Host (NF-ReasonText $r.reason) -ForegroundColor Red }
+}
+function NF-Need {
+  if ($script:Licensed) { return $true }
+  Write-Host 'This action needs an active license. Choose L to enter your key.' -ForegroundColor Yellow
+  return $false
+}
+function NF-Line($label, $ok, $text) {
+  $color = 'Green'; if (-not $ok) { $color = 'Yellow' }
+  Write-Host ('  ' + $label.PadRight(32) + $text) -ForegroundColor $color
+}
+function NF-Run($items) {
+  NF-Startup
+  while ($true) {
+    Clear-Host
+    Write-Host ('  ' + $NF_NAME.ToUpper() + '   v' + $NF_VER + '   |   Windows 10 and Windows 11') -ForegroundColor Cyan
+    if ($script:Licensed) { Write-Host '  License: ACTIVE' -ForegroundColor Green }
+    else { Write-Host '  License: not activated (free features only)' -ForegroundColor Yellow }
+    Write-Host ''
+    for ($i = 0; $i -lt $items.Count; $i++) {
+      $tag = ''; if ($items[$i].lic) { $tag = '   [license]' }
+      Write-Host ('  ' + ($i + 1) + ') ' + $items[$i].label + $tag)
+    }
+    Write-Host '  L) Enter license key'
+    Write-Host '  W) Open my account and downloads (website)'
+    Write-Host '  Q) Quit'
+    Write-Host ''
+    $c = (Read-Host 'Choose').Trim().ToUpper()
+    if ($c -eq 'Q') { break }
+    elseif ($c -eq 'L') { NF-Activate }
+    elseif ($c -eq 'W') { Start-Process ($NF_SITE + '/downloads') }
+    elseif ($c -match '^\d+$' -and [int]$c -ge 1 -and [int]$c -le $items.Count) {
+      $it = $items[[int]$c - 1]
+      if ((-not $it.lic) -or (NF-Need)) {
+        try { & $it.run } catch { Write-Host ('Something went wrong: ' + $_.Exception.Message) -ForegroundColor Red }
+      }
+    }
+    Write-Host ''
+    [void](Read-Host 'Press Enter to continue')
+  }
+}
+</script>
+<script type="text/plain" id="ps-antivirus">
+$items = @(
+  @{ label = 'Windows security check'; lic = $false; run = {
+      $os = Get-CimInstance Win32_OperatingSystem
+      Write-Host ('  ' + $os.Caption + ' (build ' + $os.BuildNumber + ')')
+      if ([int]$os.BuildNumber -lt 22000) {
+        Write-Host '  Windows 10: Microsoft ended regular security updates on 14 October 2025. Stay protected with Extended Security Updates or by moving to Windows 11.' -ForegroundColor Yellow
+        Write-Host '  This tool checks your protection and runs Microsoft Defender; it cannot replace Windows updates.' -ForegroundColor Yellow
+      }
+      Write-Host ''
+      try {
+        $mp = Get-MpComputerStatus
+        NF-Line 'Microsoft Defender' ([bool]$mp.AntivirusEnabled) $(if ($mp.AntivirusEnabled) { 'on' } else { 'OFF' })
+        NF-Line 'Real-time protection' ([bool]$mp.RealTimeProtectionEnabled) $(if ($mp.RealTimeProtectionEnabled) { 'on' } else { 'OFF' })
+        NF-Line 'Virus definitions updated' ($mp.AntivirusSignatureAge -le 3) ($mp.AntivirusSignatureLastUpdated.ToString('yyyy-MM-dd') + ' (' + $mp.AntivirusSignatureAge + ' days ago)')
+      } catch { NF-Line 'Microsoft Defender' $false 'status unavailable (another antivirus may manage this PC)' }
+      try {
+        foreach ($p in (Get-NetFirewallProfile)) { NF-Line ('Firewall: ' + $p.Name) ([bool]$p.Enabled) $(if ($p.Enabled) { 'on' } else { 'OFF' }) }
+      } catch { NF-Line 'Firewall' $false 'could not be checked' }
+      try { $sb = Confirm-SecureBootUEFI; NF-Line 'Secure Boot' ([bool]$sb) $(if ($sb) { 'on' } else { 'off' }) } catch { NF-Line 'Secure Boot' $false 'not available on this PC' }
+      try { $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive; NF-Line 'Disk encryption (BitLocker)' ($bl.ProtectionStatus -eq 'On') ([string]$bl.ProtectionStatus) } catch { NF-Line 'Disk encryption (BitLocker)' $false 'not checked (needs administrator, or not supported)' }
+      try { $smb = Get-SmbServerConfiguration; NF-Line 'Old file sharing (SMB1)' (-not $smb.EnableSMB1Protocol) $(if ($smb.EnableSMB1Protocol) { 'ON - should be off' } else { 'off' }) } catch { NF-Line 'Old file sharing (SMB1)' $false 'not checked (needs administrator)' }
+  } },
+  @{ label = 'Quick scan (Microsoft Defender)'; lic = $false; run = {
+      Write-Host '  Scanning... this can take a few minutes.'
+      Start-MpScan -ScanType QuickScan
+      Write-Host '  Scan finished. Choose "Recent detections" to see anything found.' -ForegroundColor Green
+  } },
+  @{ label = 'Recent detections'; lic = $false; run = {
+      $t = @(Get-MpThreatDetection | Select-Object -First 10)
+      if ($t.Count -eq 0) { Write-Host '  No detections recorded.' -ForegroundColor Green }
+      else { $t | Format-List InitialDetectionTime, ThreatID, ProcessName, Resources | Out-String -Width 200 | Write-Host }
+  } },
+  @{ label = 'Update virus definitions'; lic = $true; run = {
+      Write-Host '  Updating...'
+      Update-MpSignature
+      Write-Host '  Definitions updated.' -ForegroundColor Green
+  } },
+  @{ label = 'Full scan (Microsoft Defender)'; lic = $true; run = {
+      Write-Host '  Full scan started. This can take a long time; you can leave this window open.'
+      Start-MpScan -ScanType FullScan
+      Write-Host '  Full scan finished.' -ForegroundColor Green
+  } }
+)
+NF-Run $items
+</script>
+<script type="text/plain" id="ps-antitrack">
+$HostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+$BEGIN = '# NOVA-ANTITRACK-BEGIN'
+$END = '# NOVA-ANTITRACK-END'
+$Domains = @('doubleclick.net','googleadservices.com','googlesyndication.com','google-analytics.com','scorecardresearch.com','quantserve.com',
+  'adnxs.com','criteo.com','criteo.net','taboola.com','outbrain.com','pubmatic.com','rubiconproject.com','openx.net','moatads.com','krxd.net',
+  'bluekai.com','demdex.net','everesttech.net','mathtag.com','rlcdn.com','casalemedia.com','adsrvr.org','2mdn.net','serving-sys.com',
+  'amazon-adsystem.com','adform.net','smartadserver.com','sharethrough.com','tapad.com')
+function NF-StripBlock($lines) {
+  $out = @(); $skip = $false
+  foreach ($l in $lines) {
+    if ($l.Trim() -eq $BEGIN) { $skip = $true; continue }
+    if ($l.Trim() -eq $END) { $skip = $false; continue }
+    if (-not $skip) { $out += $l }
+  }
+  return ,$out
+}
+function NF-BlockCount {
+  $n = 0; $in = $false
+  foreach ($l in @(Get-Content $HostsPath)) {
+    if ($l.Trim() -eq $BEGIN) { $in = $true; continue }
+    if ($l.Trim() -eq $END) { $in = $false; continue }
+    if ($in -and $l.Trim().StartsWith('0.0.0.0')) { $n++ }
+  }
+  return $n
+}
+function NF-NeedAdmin {
+  if (NF-IsAdmin) { return $true }
+  Write-Host '  Editing the hosts file needs administrator rights.' -ForegroundColor Yellow
+  $a = Read-Host '  Restart as administrator now? (Y/N)'
+  if ($a.Trim().ToUpper() -eq 'Y') { NF-Elevate }
+  return $false
+}
+$items = @(
+  @{ label = 'Show blocking status'; lic = $false; run = {
+      $n = NF-BlockCount
+      if ($n -gt 0) { Write-Host ('  Blocking is ON: ' + $n + ' tracking addresses are blocked on this PC.') -ForegroundColor Green }
+      else { Write-Host '  Blocking is off.' }
+  } },
+  @{ label = 'Turn blocking ON'; lic = $true; run = {
+      if (-not (NF-NeedAdmin)) { return }
+      $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+      Copy-Item -Path $HostsPath -Destination (Join-Path $script:Dir ('hosts.backup-' + $stamp)) -Force
+      $clean = NF-StripBlock @(Get-Content $HostsPath)
+      $block = @($BEGIN)
+      foreach ($d in $Domains) { $block += ('0.0.0.0 ' + $d); $block += ('0.0.0.0 www.' + $d) }
+      $block += $END
+      Set-Content -Path $HostsPath -Value ($clean + $block) -Encoding ASCII
+      ipconfig /flushdns | Out-Null
+      Write-Host ('  Blocking is ON (' + ($Domains.Count * 2) + ' addresses). A backup of your hosts file was saved in ' + $script:Dir) -ForegroundColor Green
+      Write-Host '  If a website stops working, choose "Turn blocking OFF" to undo everything.'
+  } },
+  @{ label = 'Turn blocking OFF (restore)'; lic = $false; run = {
+      if (-not (NF-NeedAdmin)) { return }
+      $clean = NF-StripBlock @(Get-Content $HostsPath)
+      Set-Content -Path $HostsPath -Value $clean -Encoding ASCII
+      ipconfig /flushdns | Out-Null
+      Write-Host '  Blocking is OFF. Your hosts file is back to how it was.' -ForegroundColor Green
+  } }
+)
+NF-Run $items
+</script>
+<script type="text/plain" id="ps-cleanup">
+function NF-Files($root) {
+  $stack = New-Object System.Collections.Stack
+  $stack.Push($root)
+  while ($stack.Count -gt 0) {
+    $d = $stack.Pop()
+    try {
+      foreach ($e in [IO.Directory]::EnumerateFileSystemEntries($d)) {
+        try {
+          $a = [IO.File]::GetAttributes($e)
+          if ($a -band [IO.FileAttributes]::ReparsePoint) { continue }
+          if ($a -band [IO.FileAttributes]::Directory) { $stack.Push($e) } else { $e }
+        } catch {}
+      }
+    } catch {}
+  }
+}
+function NF-OldTemp {
+  $cut = (Get-Date).AddHours(-1)
+  if (-not $env:TEMP -or $env:TEMP.Length -lt 8) { throw 'Temp folder not found.' }
+  foreach ($f in (NF-Files $env:TEMP)) {
+    try { $fi = New-Object IO.FileInfo $f; if ($fi.LastWriteTime -lt $cut) { $fi } } catch {}
+  }
+}
+$items = @(
+  @{ label = 'Scan temporary files'; lic = $false; run = {
+      $list = @(NF-OldTemp)
+      $sum = ($list | Measure-Object -Property Length -Sum).Sum
+      if (-not $sum) { $sum = 0 }
+      Write-Host ('  Found {0} old temporary files ({1:N1} MB) in {2}' -f $list.Count, ($sum / 1MB), $env:TEMP)
+      Write-Host '  Only files not changed in the last hour are counted. Nothing was deleted.'
+  } },
+  @{ label = 'Clean temporary files now'; lic = $true; run = {
+      $list = @(NF-OldTemp)
+      if ($list.Count -eq 0) { Write-Host '  Nothing to clean.'; return }
+      $sum = ($list | Measure-Object -Property Length -Sum).Sum
+      $ans = Read-Host ('  Delete {0} files ({1:N1} MB)? Files in use are skipped. (Y/N)' -f $list.Count, ($sum / 1MB))
+      if ($ans.Trim().ToUpper() -ne 'Y') { Write-Host '  Cancelled.'; return }
+      $done = 0; $freed = 0; $skipped = 0
+      foreach ($fi in $list) { try { $len = $fi.Length; [IO.File]::Delete($fi.FullName); $done++; $freed += $len } catch { $skipped++ } }
+      Write-Host ('  Removed {0} files ({1:N1} MB). {2} in use were skipped.' -f $done, ($freed / 1MB), $skipped) -ForegroundColor Green
+  } }
+)
+NF-Run $items
+</script>
+<script type="text/plain" id="ps-driver-updater">
+$items = @(
+  @{ label = 'List older drivers (2+ years)'; lic = $false; run = {
+      $cut = (Get-Date).AddYears(-2)
+      $d = @(Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -and $_.DriverDate -and $_.DriverDate -lt $cut -and $_.Manufacturer -ne 'Microsoft' } |
+        Sort-Object DriverDate | Select-Object -First 25 DeviceName, Manufacturer, DriverVersion, @{ n = 'Date'; e = { $_.DriverDate.ToString('yyyy-MM-dd') } })
+      if ($d.Count -eq 0) { Write-Host '  No drivers older than 2 years were found.' -ForegroundColor Green }
+      else {
+        $d | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+        Write-Host '  An old date does not always mean a problem. Update drivers that belong to devices you have trouble with.'
+      }
+  } },
+  @{ label = 'Search Windows Update for driver updates'; lic = $true; run = {
+      Write-Host '  Searching Windows Update... this can take a minute.'
+      $session = New-Object -ComObject Microsoft.Update.Session
+      $res = $session.CreateUpdateSearcher().Search("IsInstalled=0 and Type='Driver'")
+      if ($res.Updates.Count -eq 0) { Write-Host '  No driver updates are waiting.' -ForegroundColor Green; return }
+      Write-Host ('  ' + $res.Updates.Count + ' driver update(s) available:')
+      for ($i = 0; $i -lt $res.Updates.Count; $i++) { Write-Host ('   - ' + $res.Updates.Item($i).Title) }
+      Write-Host '  Install them in Settings > Windows Update > Advanced options > Optional updates.'
+  } },
+  @{ label = 'Open Windows Update'; lic = $false; run = { Start-Process 'ms-settings:windowsupdate' } }
+)
+NF-Run $items
+</script>
 <script id="brand-assets">
 window.NFIO_BRAND = Object.freeze({
   header: "data:image/webp;base64,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",
@@ -227,11 +524,40 @@ window.NFIO_BRAND = Object.freeze({
    7 pages (home, services, pricing, status, auth pages, account, contact, email) | 8 boot
    ===================================================================== */
 
+/* ---------- 0. CLEAN URLS (no #) ----------
+   On a real website the address bar shows /pricing instead of /#/pricing. Private pages use hidden codes.
+   The host must send every path to index.html (see site-hosting/HOSTING.txt). In previews or file:// the
+   site falls back to the old #/ style automatically, so it never breaks. */
+const PATH_MODE = (function () {
+  try {
+    if (!/^https?:$/.test(location.protocol)) return false;
+    history.replaceState(history.state, '', location.href);
+    const r = sessionStorage.getItem('nf_redirect');           // set by 404.html on hosts without rewrites
+    if (r) { sessionStorage.removeItem('nf_redirect'); const u = new URL(r); history.replaceState(null, '', u.pathname + u.search + u.hash); }
+    return true;
+  } catch (_) { return false; }
+})();
+const ROUTE_ALIASES = {
+  '/account': '/3deca5d1bc',
+  '/dashboard': '/cb4e734d99',
+  '/register': '/737f6afe2f',
+  '/discord': '/28fbb4b18a',
+  '/mfa': '/0ee0cb3a68',
+  '/reset': '/19726db280'
+};
+const ALIAS_REVERSE = Object.fromEntries(Object.entries(ROUTE_ALIASES).map(([k, v]) => [v, k]));
+function prettyPath(route) {
+  route = String(route).replace(/^#/, '') || '/';
+  const i = route.indexOf('?');
+  const path = i < 0 ? route : route.slice(0, i), q = i < 0 ? '' : route.slice(i);
+  return (ROUTE_ALIASES[path] || path) + q;
+}
+
 /* ---------- 1. CONFIG ---------- */
 const CONFIG = Object.freeze({
   SUPABASE_URL: 'https://ezmguwirjbxchztemmyz.supabase.co',
   SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_klNFYpf47dpF7daEiq3pgQ_xoj7cZuq', // safe for browsers; protected by RLS
-  SITE_URL: location.origin + location.pathname,
+  SITE_URL: PATH_MODE ? location.origin + '/' : location.origin + location.pathname,
   SUPPORT_EMAIL: 'info@novaframeio.com',
   DISCORD_SCOPES: 'identify email guilds',
   MIN_PASSWORD: 10,
@@ -378,12 +704,12 @@ async function signOut() {
   await sb.auth.signOut();
   try { sessionStorage.removeItem('nf_login_recorded'); } catch (_) { /* ignore */ }
   toast('You have been signed out.', 'ok');
-  location.hash = '#/';
+  go('#/');
 }
 async function afterLogin(next) {
   const a = await mfaState();
-  if (a.nextLevel === 'aal2' && a.currentLevel !== 'aal2') location.hash = '#/mfa' + (next ? '?next=' + encodeURIComponent(next) : '');
-  else location.hash = next || '#/account';
+  if (a.nextLevel === 'aal2' && a.currentLevel !== 'aal2') go('#/mfa' + (next ? '?next=' + encodeURIComponent(next) : ''));
+  else go(next || '#/account');
 }
 async function initAuth() {
   const { data } = await sb.auth.getSession();
@@ -395,8 +721,8 @@ async function initAuth() {
       await loadProfile();
       if (event === 'SIGNED_IN') recordLoginOnce();
       renderAuthArea();
-      if (event === 'PASSWORD_RECOVERY') location.hash = '#/reset';
-      if (event === 'SIGNED_OUT' && PROTECTED_ROUTES.has(currentPath())) location.hash = '#/login';
+      if (event === 'PASSWORD_RECOVERY') go('#/reset');
+      if (event === 'SIGNED_OUT' && PROTECTED_ROUTES.has(currentPath())) go('#/login');
     }, 0);
   });
   const qp = new URLSearchParams(location.search);
@@ -409,13 +735,47 @@ async function initAuth() {
 /* ---------- 5. ROUTER ---------- */
 const PROTECTED_ROUTES = new Set(['/account']);
 function parseHash() {
+  if (PATH_MODE) {
+    if (/^#\//.test(location.hash)) { try { history.replaceState(null, '', prettyPath(location.hash)); } catch (_) { /* ignore */ } }  // old #/ links still work
+    let p = location.pathname;
+    try { p = decodeURIComponent(p); } catch (_) { /* keep raw */ }
+    p = p.replace(/\/index\.html$/i, '/').replace(/\/+$/, '') || '/';
+    return { path: ALIAS_REVERSE[p] || p, query: new URLSearchParams(location.search) };
+  }
   const raw = location.hash.replace(/^#/, '') || '/';
   const i = raw.indexOf('?');
   return { path: i < 0 ? raw : raw.slice(0, i), query: new URLSearchParams(i < 0 ? '' : raw.slice(i + 1)) };
 }
+function go(route, replace) {
+  route = String(route || '/').replace(/^#/, '') || '/';
+  if (route[0] !== '/') route = '/' + route;
+  if (PATH_MODE) {
+    try { (replace ? history.replaceState : history.pushState).call(history, null, '', prettyPath(route)); }
+    catch (_) { location.href = prettyPath(route); return; }
+    setTimeout(render, 0);
+  } else { location.hash = '#' + route; }
+}
+function prettifyLinks() {
+  if (!PATH_MODE) return;
+  document.querySelectorAll('a[href^="#/"]').forEach(a => {
+    if (!a.dataset.r) a.dataset.r = a.getAttribute('href');
+    a.setAttribute('href', prettyPath(a.dataset.r));
+  });
+}
+function wireLinks() {
+  document.addEventListener('click', ev => {
+    if (!PATH_MODE || ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    const a = ev.target.closest && ev.target.closest('a[data-r]');
+    if (!a || a.target === '_blank') return;
+    ev.preventDefault();
+    go(a.dataset.r);
+  });
+}
+let RENDER_SEQ = 0;
 function currentPath() { return parseHash().path; }
 const ROUTES = {};
 async function render() {
+  const my = ++RENDER_SEQ;
   S.cleanups.splice(0).forEach(fn => { try { fn(); } catch (_) { /* ignore */ } });
   const { path, query } = parseHash();
   const app = $('#app');
@@ -424,11 +784,12 @@ async function render() {
   });
   $('#nav').classList.remove('open');
   $('#navToggle').setAttribute('aria-expanded', 'false');
-  if (PROTECTED_ROUTES.has(path) && !S.session) { location.hash = '#/login?next=' + encodeURIComponent('#' + path); return; }
+  if (PROTECTED_ROUTES.has(path) && !S.session) { go('#/login?next=' + encodeURIComponent('#' + path)); return; }
   app.replaceChildren(loadingEl());
   try {
     S.backendError = null;
     const node = await (ROUTES[path] || pageNotFound)(query);
+    if (my !== RENDER_SEQ) return;
     if (S.backendError) {
       app.replaceChildren(h('div', { class: 'wrap', style: 'padding:0;margin-top:20px' },
         h('div', { class: 'notice bad', role: 'alert' }, h('strong', {}, 'Live data could not be loaded. '), S.backendError,
@@ -438,6 +799,7 @@ async function render() {
     console.error(describeError(e));
     app.replaceChildren(errorEl(e));
   }
+  prettifyLinks();
   window.scrollTo(0, 0);
   const hd = $('#app h1'); if (hd) { hd.setAttribute('tabindex', '-1'); hd.focus({ preventScroll: true }); }
 }
@@ -450,15 +812,18 @@ async function fetchServices() {
   return data || [];
 }
 async function fetchPlans() {
-  const { data, error } = await sb.from('nf_plans')
-    .select('id,service_key,name,billing_type,price_cents,billing_interval,trial_days,refund_window_days,requires_approval,limits,sort_order')
-    .order('sort_order');
-  if (error) { S.backendError = friendlyError(error); return []; }
-  return data || [];
+  const cols = 'id,service_key,name,billing_type,price_cents,billing_interval,trial_days,refund_window_days,requires_approval,limits,sort_order';
+  let res = await sb.from('nf_plans').select(cols + ',interval_count').order('sort_order');
+  if (res.error && /interval_count/i.test(describeError(res.error))) res = await sb.from('nf_plans').select(cols).order('sort_order');
+  if (res.error) { S.backendError = friendlyError(res.error); return []; }
+  return res.data || [];
 }
+function termMonths(p) { const n = Number(p.interval_count) || 1; return p.billing_interval === 'year' ? n * 12 : n; }
+function termLabel(p) { const m = termMonths(p); return m === 1 ? 'monthly' : m === 12 ? 'yearly' : m % 12 === 0 ? 'every ' + (m / 12) + ' years' : 'every ' + m + ' months'; }
+function termUnit(p) { const m = termMonths(p); return m === 1 ? 'month' : m === 12 ? 'year' : m % 12 === 0 ? (m / 12) + ' years' : m + ' months'; }
 function planFeatures(p) {
   const f = [], L = p.limits || {};
-  f.push(p.billing_type === 'recurring' ? 'Billed ' + (p.billing_interval === 'year' ? 'yearly' : 'monthly') : 'One-time payment');
+  f.push(p.billing_type === 'recurring' ? 'Billed ' + termLabel(p) : 'One-time payment');
   if (p.trial_days > 0) f.push(p.trial_days + '-day free trial');
   if (L.max_services != null) {
     const unit = p.service_key === 'website' ? (L.max_services === 1 ? 'protected site' : 'protected sites') : 'registered services';
@@ -472,7 +837,7 @@ function planFeatures(p) {
 }
 function planPrice(p) {
   return h('div', { class: 'price' }, money(p.price_cents),
-    p.billing_type === 'recurring' ? h('small', {}, ' / ' + (p.billing_interval === 'year' ? 'year' : 'month')) : h('small', {}, ' one-time'));
+    p.billing_type === 'recurring' ? h('small', {}, ' / ' + termUnit(p)) : h('small', {}, ' one-time'));
 }
 function cheapestRecurring(plans, key) {
   const r = plans.filter(p => p.service_key === key && p.billing_type === 'recurring').sort((a, b) => a.price_cents - b.price_cents)[0];
@@ -546,6 +911,19 @@ ROUTES['/services'] = async function pageServices() {
       h('div', { class: 'grid grid-3' }, soon.map(s => serviceCard(s, plans)))) : null);
 };
 
+function planAction(p) {
+  if (!S.session) return h('a', { class: 'btn btn-red', href: '#/signup' }, 'Sign up to get started');
+  if (p.trial_days > 0) {
+    return h('button', { class: 'btn btn-red', type: 'button', onclick: async ev => {
+      const b = ev.currentTarget; busy(b, true, 'Starting…');
+      const { error } = await sb.rpc('nfp_start_trial', { p_plan_id: p.id });
+      busy(b, false);
+      if (error) { toast(friendlyError(error), 'bad'); return; }
+      toast('Your free trial has started.', 'ok'); go('#/account');
+    } }, 'Start ' + p.trial_days + '-day free trial');
+  }
+  return h('a', { class: 'btn ' + (p.billing_type === 'recurring' ? 'btn-red' : 'btn-ghost'), href: '#/contact?topic=' + encodeURIComponent(p.id) }, 'Request activation');
+}
 /* 7.3 PRICING */
 ROUTES['/pricing'] = async function pagePricing(query) {
   setTitle('Pricing');
@@ -561,9 +939,7 @@ ROUTES['/pricing'] = async function pagePricing(query) {
         h('h3', { style: 'margin:10px 0 6px' }, p.name),
         planPrice(p),
         h('ul', {}, planFeatures(p).map(t => h('li', {}, t))),
-        h('a', { class: 'btn ' + (p.billing_type === 'recurring' ? 'btn-red' : 'btn-ghost'),
-          href: S.session ? '#/contact?topic=' + encodeURIComponent(p.id) : '#/signup' },
-          S.session ? 'Request activation' : 'Sign up to get started')))));
+        planAction(p)))));
   });
   return h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('h1', {}, 'Pricing'),
@@ -594,52 +970,77 @@ async function measureBackend() {
     return { status: ms > 1500 ? 'degraded' : 'operational', ms };
   } catch (_) { return { status: 'offline', ms: null }; }
 }
-function overallSummary(rows, backend) {
-  const all = [{ status: backend.status }, ...rows];
-  if (all.some(r => r.status === 'offline')) return { status: 'offline', text: 'Service disruption detected' };
-  if (all.some(r => r.status === 'degraded')) return { status: 'degraded', text: 'Partial degradation' };
-  if (all.some(r => r.status === 'maintenance')) return { status: 'maintenance', text: 'Scheduled maintenance in progress' };
-  const reporting = rows.filter(r => r.status !== 'unknown').length;
-  if (reporting === 0) return { status: 'unknown', text: 'Monitoring has not reported yet' };
-  const pending = rows.length - reporting;
-  return { status: 'operational', text: pending ? 'All reporting systems operational (' + pending + ' not yet monitored)' : 'All systems operational' };
+async function timedCheck(fn) {
+  const t0 = performance.now();
+  try {
+    const r = await Promise.race([fn(), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))]);
+    const ms = Math.round(performance.now() - t0);
+    if (r && r.status) return Object.assign({ ms }, r);
+    return { status: r === false ? 'offline' : (ms > 1500 ? 'degraded' : 'operational'), ms };
+  } catch (e) { return { status: 'offline', ms: null, message: describeError(e) === 'timeout' ? 'Timed out' : null }; }
+}
+async function measurePlatform() {
+  const defs = [
+    ['Website', async () => { try { const r = await fetch(location.origin + '/', { method: 'HEAD', cache: 'no-store' }); return r.status < 500; } catch (_) { return { status: 'operational', ms: null, message: 'This page loaded; direct timing not available here.' }; } }],
+    ['Database and API', async () => { const { error } = await sb.rpc('nf_ping'); return !error; }],
+    ['Sign-in (authentication)', async () => { const r = await fetch(CONFIG.SUPABASE_URL + '/auth/v1/health', { headers: { apikey: CONFIG.SUPABASE_PUBLISHABLE_KEY } }); return r.ok; }],
+    ['License service (apps)', async () => {
+      const { error } = await sb.rpc('nfa_latest_release', { p_app: 'cleanup', p_version: '0' });
+      if (error && /could not find|schema cache|does not exist|PGRST202/i.test(describeError(error))) return { status: 'unknown', ms: null, message: 'Not set up yet' };
+      return !error;
+    }]
+  ];
+  const out = await Promise.all(defs.map(async ([name, fn]) => Object.assign({ name, measured: true }, await timedCheck(fn))));
+  return out;
+}
+function overallSummary(rows) {
+  if (rows.some(r => r.status === 'offline')) return { status: 'offline', text: 'Service disruption detected' };
+  if (rows.some(r => r.status === 'degraded')) return { status: 'degraded', text: 'Partial degradation' };
+  if (rows.some(r => r.status === 'maintenance')) return { status: 'maintenance', text: 'Scheduled maintenance in progress' };
+  const reporting = rows.filter(r => r.status !== 'unknown');
+  if (!reporting.length) return { status: 'unknown', text: 'Monitoring has not reported yet' };
+  const pending = rows.length - reporting.length;
+  return { status: 'operational', text: pending ? 'Everything we monitor is operational (' + pending + ' not yet monitored)' : 'All systems operational' };
 }
 ROUTES['/status'] = async function pageStatus() {
   setTitle('System status');
   const holder = h('div', {});
   async function paint() {
-    const [backend, rowsRes, upRes] = await Promise.all([
-      measureBackend(),
+    const [platform, rowsRes, upRes, services] = await Promise.all([
+      measurePlatform(),
       sb.from('nf_service_status').select('component,name,status,latency_ms,message,checked_at,sort_order').order('sort_order'),
-      sb.from('nf_uptime_30d').select('component,checks,uptime_pct')
+      sb.from('nf_uptime_30d').select('component,checks,uptime_pct'),
+      fetchServices()
     ]);
-    if (rowsRes.error) throw new Error(describeError(rowsRes.error));
-    const rows = rowsRes.data || [];
+    const monitored = (rowsRes.data || []).map(r => ({ key: r.component, name: r.name, status: r.status, ms: r.latency_ms, message: r.message, checked: r.checked_at }));
+    const have = new Set(monitored.map(r => r.key));
+    const rest = services.filter(s => !have.has(s.key)).map(s => s.status === 'available'
+      ? { key: s.key, name: s.name, status: 'unknown', message: 'Not yet monitored' }
+      : { key: s.key, name: s.name, status: 'unknown', message: 'In development, not released yet' });
+    const all = [...platform, ...monitored, ...rest];
     const up = Object.fromEntries((upRes.data || []).map(u => [u.component, u]));
-    const sum = overallSummary(rows, backend);
+    const sum = overallSummary(all);
+    const rowEl = r => {
+      const u = r.key ? up[r.key] : null;
+      return h('tr', {}, h('td', {}, r.name, r.message ? h('div', { class: 'hint' }, r.message) : null), h('td', {}, pill(r.status)),
+        h('td', {}, r.ms != null ? r.ms + ' ms' : 'n/a'),
+        h('td', {}, u && u.uptime_pct != null ? u.uptime_pct + '% (' + u.checks + ' checks)' : (r.measured ? 'n/a' : 'No data yet')),
+        h('td', {}, r.measured ? 'just now' : (r.checked ? timeAgo(r.checked) : 'Not yet monitored')));
+    };
     holder.replaceChildren(
       h('div', { class: 'card status-banner' }, h('div', {}, h('h2', { style: 'font-size:1.3rem' }, sum.text),
         h('p', {}, 'Updated ' + new Date().toLocaleTimeString())), pill(sum.status)),
       h('div', { class: 'section card', style: 'padding:8px 18px' },
         h('table', { class: 'data' },
           h('thead', {}, h('tr', {}, ['Component', 'Status', 'Latency', '30-day uptime', 'Last check'].map(t => h('th', { scope: 'col' }, t)))),
-          h('tbody', {},
-            h('tr', {}, h('td', {}, 'Website and backend (measured from your browser now)'), h('td', {}, pill(backend.status)),
-              h('td', {}, backend.ms != null ? backend.ms + ' ms' : 'n/a'), h('td', {}, 'n/a'), h('td', {}, 'just now')),
-            rows.map(r => {
-              const u = up[r.component];
-              return h('tr', {}, h('td', {}, r.name, r.message ? h('div', { class: 'hint' }, r.message) : null), h('td', {}, pill(r.status)),
-                h('td', {}, r.latency_ms != null ? r.latency_ms + ' ms' : 'n/a'),
-                h('td', {}, u && u.uptime_pct != null ? u.uptime_pct + '% (' + u.checks + ' checks)' : 'No data yet'),
-                h('td', {}, r.checked_at ? timeAgo(r.checked_at) : 'Not yet monitored'));
-            })))),
-      h('p', { class: 'hint', style: 'margin-top:14px' }, 'Uptime is calculated only from real checks reported by our monitors. Nothing here is estimated.'));
+          h('tbody', {}, all.map(rowEl)))),
+      h('p', { class: 'hint', style: 'margin-top:14px' }, 'Platform rows are measured from your browser right now. Service rows come from our monitors. A service shows "Unknown" until it reports real checks, because we never show a green light we have not measured.'));
   }
   await paint();
   const timer = setInterval(() => paint().catch(() => {}), CONFIG.STATUS_REFRESH_MS);
   S.cleanups.push(() => clearInterval(timer));
   return h('div', { class: 'page' }, h('div', { class: 'page-head' }, h('h1', {}, 'System status'),
-    h('p', {}, 'Live health of the Nova Frame IO platform.')), holder);
+    h('p', {}, 'Live health of the Nova Frame IO platform, in order.')), holder);
 };
 
 /* 7.5 AUTH PAGES */
@@ -654,7 +1055,7 @@ function discordButton() {
 }
 ROUTES['/login'] = async function pageLogin(query) {
   setTitle('Log in');
-  if (S.session) { location.hash = '#/account'; return h('div'); }
+  if (S.session) { go('#/account'); return h('div'); }
   const next = query.get('next');
   const msg = h('div', { role: 'alert' });
   const form = h('form', { novalidate: true, onsubmit: async ev => {
@@ -677,7 +1078,7 @@ ROUTES['/login'] = async function pageLogin(query) {
 };
 ROUTES['/signup'] = async function pageSignup() {
   setTitle('Create account');
-  if (S.session) { location.hash = '#/account'; return h('div'); }
+  if (S.session) { go('#/account'); return h('div'); }
   const msg = h('div', { role: 'alert' });
   const form = h('form', { novalidate: true, onsubmit: async ev => {
     ev.preventDefault(); msg.replaceChildren();
@@ -726,18 +1127,18 @@ ROUTES['/reset'] = async function pageReset() {
     if (pw.length < CONFIG.MIN_PASSWORD) { msg.append(h('div', { class: 'notice bad' }, 'Use at least ' + CONFIG.MIN_PASSWORD + ' characters.')); return; }
     const { error } = await sb.auth.updateUser({ password: pw });
     if (error) { msg.append(h('div', { class: 'notice bad' }, friendlyError(error))); return; }
-    toast('Password updated.', 'ok'); location.hash = '#/account';
+    toast('Password updated.', 'ok'); go('#/account');
   } }, field('New password', 'password', 'password', { autocomplete: 'new-password', minlength: CONFIG.MIN_PASSWORD }), msg,
     h('button', { class: 'btn btn-red', type: 'submit', style: 'width:100%' }, 'Update password'));
   return authCard('Choose a new password', null, form);
 };
 ROUTES['/mfa'] = async function pageMfa(query) {
   setTitle('Two-factor verification');
-  if (!S.session) { location.hash = '#/login'; return h('div'); }
+  if (!S.session) { go('#/login'); return h('div'); }
   const { data, error } = await sb.auth.mfa.listFactors();
   if (error) throw new Error(describeError(error));
   const factor = (data.totp || []).find(f => f.status === 'verified');
-  if (!factor) { location.hash = '#/account'; return h('div'); }
+  if (!factor) { go('#/account'); return h('div'); }
   const msg = h('div', { role: 'alert' });
   const form = h('form', { novalidate: true, onsubmit: async ev => {
     ev.preventDefault(); msg.replaceChildren();
@@ -749,7 +1150,7 @@ ROUTES['/mfa'] = async function pageMfa(query) {
     const v = await sb.auth.mfa.verify({ factorId: factor.id, challengeId: ch.data.id, code });
     busy(btn, false);
     if (v.error) { msg.append(h('div', { class: 'notice bad' }, 'That code was not accepted. Try again.')); return; }
-    location.hash = query.get('next') || '#/account';
+    go(query.get('next') || '#/account');
   } }, field('Authenticator code', 'code', 'text', { inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6, placeholder: '123456' }), msg,
     h('button', { class: 'btn btn-red', type: 'submit', style: 'width:100%' }, 'Verify'));
   return authCard('Two-factor verification', 'Enter the code from your authenticator app.', form);
@@ -818,7 +1219,7 @@ ROUTES['/account'] = async function pageAccount() {
       subs.length ? h('div', { class: 'card', style: 'padding:8px 18px' }, h('table', { class: 'data' },
         h('thead', {}, h('tr', {}, ['Plan', 'Status', 'Renews / ends'].map(t => h('th', { scope: 'col' }, t)))),
         h('tbody', {}, subs.map(s => h('tr', {},
-          h('td', {}, s.plan ? s.plan.name + ' (' + money(s.plan.price_cents) + (s.plan.billing_type === 'recurring' ? ' / ' + (s.plan.billing_interval === 'year' ? 'yr' : 'mo') : ' one-time') + ')' : 'Plan'),
+          h('td', {}, s.plan ? s.plan.name + ' (' + money(s.plan.price_cents) + (s.plan.billing_type !== 'recurring' ? ' one-time' : /month|year/i.test(s.plan.name) ? '' : ' / ' + (s.plan.billing_interval === 'year' ? 'yr' : 'mo')) + ')' : 'Plan'),
           h('td', {}, s.status.replace('_', ' ') + (s.cancel_at_period_end ? ' (cancels at period end)' : '')),
           h('td', {}, s.current_period_end ? fmtDate(s.current_period_end) : 'No end date')))))) :
         h('div', { class: 'card' }, h('p', {}, 'You have no subscriptions yet. '), h('a', { class: 'btn btn-red btn-sm', style: 'margin-top:12px', href: '#/pricing' }, 'View pricing'))));
@@ -909,7 +1310,9 @@ function wireShell() {
     $('#subForm').reset();
     toast('Almost done. You will only be subscribed after you confirm from the email we send.', 'ok');
   });
-  window.addEventListener('hashchange', render);
+  window.addEventListener(PATH_MODE ? 'popstate' : 'hashchange', render);
+  wireLinks();
+  prettifyLinks();
 }
 /* =====================================================================
    NFIO PATCH: Batch A (dashboard + registrations) and Discord integration page
@@ -1123,8 +1526,8 @@ function renderAuthArea() {
 }
 async function afterLogin(next) {
   const a = await mfaState();
-  if (a.nextLevel === 'aal2' && a.currentLevel !== 'aal2') location.hash = '#/mfa' + (next ? '?next=' + encodeURIComponent(next) : '');
-  else location.hash = next || '#/dashboard';
+  if (a.nextLevel === 'aal2' && a.currentLevel !== 'aal2') go('#/mfa' + (next ? '?next=' + encodeURIComponent(next) : ''));
+  else go(next || '#/dashboard');
 }
 
 /* ===== Batch B: desktop apps, downloads and license keys ===== */
@@ -1188,7 +1591,7 @@ ROUTES['/downloads'] = async function pageDownloads() {
       h('h3', {}, a.name),
       h('p', {}, a.description || a.tagline || ''),
       h('div', { class: 'meta' }, a.platform === 'windows' ? 'For Windows' : a.platform),
-      canDl ? h('div', { style: 'margin-top:14px' },
+      (live && EMBEDDED_APPS[a.key]) ? embeddedDownload(a) : canDl ? h('div', { style: 'margin-top:14px' },
         h('a', { class: 'btn btn-red btn-sm', href: r.download_url, rel: 'noopener' }, 'Download v' + r.version + (r.size_bytes ? ' (' + fmtBytes(r.size_bytes) + ')' : '')),
         r.sha256 ? h('p', { class: 'hint mono', style: 'margin-top:8px' }, 'SHA-256: ' + r.sha256) : null)
         : (live ? h('p', { class: 'hint', style: 'margin-top:12px' }, 'The download link is not published yet.') : null),
@@ -1197,9 +1600,49 @@ ROUTES['/downloads'] = async function pageDownloads() {
   const apps = appsRes.data || [];
   return h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('h1', {}, 'Downloads'),
-      h('p', {}, 'Nova desktop apps. Each app needs a license key from an active subscription. Keys are tied to your account and shown only once.')),
+      h('p', {}, 'Nova apps are built for Windows 10 and Windows 11, to help protect PCs that no longer get regular updates from Microsoft. Apps download straight from this page. Free features work right away; extra features need a license key from an active subscription. Keys are tied to your account and shown only once.')),
     apps.length ? h('div', { class: 'grid grid-3' }, apps.map(appCard)) : h('p', {}, 'No apps are published yet.'));
 };
+
+/* ===== Batch C: Windows apps built into the site (generated in the browser, no installer) ===== */
+const APP_VERSION = '1.0.0';
+const EMBEDDED_APPS = {
+  'antivirus':      { file: 'Nova-Antivirus',      name: 'Nova Antivirus' },
+  'antitrack':      { file: 'Nova-AntiTrack',      name: 'Nova AntiTrack' },
+  'cleanup':        { file: 'Nova-Cleanup',        name: 'Nova Cleanup' },
+  'driver-updater': { file: 'Nova-Driver-Updater', name: 'Nova Driver Updater' }
+};
+function buildAppFile(key) {
+  const def = EMBEDDED_APPS[key];
+  const common = document.getElementById('ps-common'), body = document.getElementById('ps-' + key);
+  if (!def || !common || !body) throw new Error('This app is not part of this page.');
+  const site = /^https?:$/.test(location.protocol) ? location.origin : 'https://novaframeio.com';
+  const q = v => "'" + String(v).replace(/'/g, "''") + "'";
+  const header =
+    '$NF_APP = ' + q(key) + '; $NF_NAME = ' + q(def.name) + '; $NF_URL = ' + q(CONFIG.SUPABASE_URL) +
+    '; $NF_KEY = ' + q(CONFIG.SUPABASE_PUBLISHABLE_KEY) + '; $NF_SITE = ' + q(site) + '; $NF_PAGE_VER = ' + q(APP_VERSION) + '\n';
+  const launcher = [
+    '@echo off', 'setlocal', 'set "NF_SELF=%~f0"', 'title ' + def.name.replace(/[&|<>^%"]/g, ''),
+    'powershell -NoProfile -ExecutionPolicy Bypass -Command "$f=[IO.File]::ReadAllText($env:NF_SELF); $m=\'#PS\'+\'START\'; $i=$f.IndexOf($m); if($i -lt 0){exit 1}; Invoke-Expression ($f.Substring($i+$m.Length))"',
+    'if errorlevel 1 pause', 'exit /b', '#PSSTART'
+  ].join('\r\n') + '\r\n';
+  return launcher + (header + common.textContent + '\n' + body.textContent).replace(/\r?\n/g, '\r\n');
+}
+function downloadApp(key) {
+  try {
+    const text = buildAppFile(key);
+    const blob = new Blob([text], { type: 'application/octet-stream' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = EMBEDDED_APPS[key].file + '.cmd';
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  } catch (e) { toast(friendlyError(e), 'bad'); }
+}
+function embeddedDownload(a) {
+  return h('div', { style: 'margin-top:14px' },
+    h('button', { class: 'btn btn-red btn-sm', type: 'button', onclick: () => downloadApp(a.key) }, 'Download for Windows 10 / 11'),
+    h('p', { class: 'hint', style: 'margin-top:8px' }, 'Open the file you downloaded. If your browser or Windows warns about it, choose Keep, then More info > Run anyway (the app is not code-signed yet). It opens a simple menu in a window. Free features work straight away; license features need your key.'));
+}
 
 (async function boot() {
   try {
