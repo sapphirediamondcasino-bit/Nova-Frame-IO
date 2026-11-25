@@ -918,8 +918,18 @@ function planAction(p) {
       const b = ev.currentTarget; busy(b, true, 'Starting…');
       const { error } = await sb.rpc('nfp_start_trial', { p_plan_id: p.id });
       busy(b, false);
-      if (error) { toast(friendlyError(error), 'bad'); return; }
-      toast('Your free trial has started.', 'ok'); go('#/account');
+      if (!error) { toast('Your free trial has started.', 'ok'); go('#/account'); return; }
+      const raw = describeError(error);
+      // The trial function expects a UUID plan id while plans use short ids, so it cannot
+      // complete from the browser yet. Offer the activation route instead of a raw DB error.
+      if (/invalid input syntax for type uuid|22P02/i.test(raw)) {
+        b.replaceWith(h('div', { class: 'notice' },
+          h('strong', {}, 'Trials cannot be started from the website yet. '),
+          'Request activation and our team will start your trial. ',
+          h('a', { href: '#/contact?topic=' + encodeURIComponent(p.id) }, 'Request activation')));
+        return;
+      }
+      toast(friendlyError(error), 'bad');
     } }, 'Start ' + p.trial_days + '-day free trial');
   }
   return h('a', { class: 'btn ' + (p.billing_type === 'recurring' ? 'btn-red' : 'btn-ghost'), href: '#/contact?topic=' + encodeURIComponent(p.id) }, 'Request activation');
@@ -1584,10 +1594,15 @@ ROUTES['/downloads'] = async function pageDownloads() {
     return h('div', {}, out);
   }
   function appCard(a) {
-    const r = rel[a.key], live = a.status === 'available';
-    const canDl = live && r && /^(https:\/\/|downloads\/)/.test(r.download_url);
+    const r = rel[a.key];
+    // Apps that ship inside this page are always available: the file is generated from the
+    // sources below, so it does not depend on a database status or an uploaded .exe.
+    const embedded = !!EMBEDDED_APPS[a.key];
+    const live = embedded || a.status === 'available';
+    // Only real absolute links are offered; relative paths point at files that are not uploaded.
+    const canDl = !embedded && live && r && /^https:\/\//.test(r.download_url || '');
     return h('article', { class: 'card svc' },
-      h('span', { class: 'badge ' + (live ? 'ok' : 'blue') }, live ? 'Available' : 'Coming soon'),
+      h('span', { class: 'badge ' + (live ? 'ok' : 'blue') }, live ? 'Available now' : 'Coming soon'),
       h('h3', {}, a.name),
       h('p', {}, a.description || a.tagline || ''),
       h('div', { class: 'meta' }, a.platform === 'windows' ? 'For Windows' : a.platform),
@@ -1597,10 +1612,15 @@ ROUTES['/downloads'] = async function pageDownloads() {
         : (live ? h('p', { class: 'hint', style: 'margin-top:12px' }, 'The download link is not published yet.') : null),
       live ? licensePanel(a) : null);
   }
-  const apps = appsRes.data || [];
+  const apps = (appsRes.data || []).slice();
+  // Make sure every app that is built into this page is listed even if the database row is missing.
+  const known = new Set(apps.map(a => a.key));
+  Object.entries(EMBEDDED_APPS).forEach(([key, def]) => {
+    if (!known.has(key)) apps.push({ key, name: def.name, tagline: '', description: '', status: 'available', platform: 'windows' });
+  });
   return h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('h1', {}, 'Downloads'),
-      h('p', {}, 'Nova apps are built for Windows 10 and Windows 11, to help protect PCs that no longer get regular updates from Microsoft. Apps download straight from this page. Free features work right away; extra features need a license key from an active subscription. Keys are tied to your account and shown only once.')),
+      h('p', {}, 'Nova apps are built for Windows 10 and Windows 11, to help protect PCs that no longer get regular updates from Microsoft. The four tools below are available now and download straight from this page. Free features work right away; extra features need a license key from an active subscription. Keys are tied to your account and shown only once.')),
     apps.length ? h('div', { class: 'grid grid-3' }, apps.map(appCard)) : h('p', {}, 'No apps are published yet.'));
 };
 
