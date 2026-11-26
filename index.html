@@ -1678,37 +1678,35 @@ function adminBtn(label, fn, cls) {
     } catch (e) { busy(b, false); toast(friendlyError(e), 'bad'); }
   } }, label);
 }
-async function adminWrite(fn, okMsg) {
-  const res = await fn();
-  if (res.error) throw res.error;
-  return okMsg;
+/* A missing table, view or function means supabase/setup.sql has not been
+   applied yet. Everything else is a real failure and has to be shown. */
+function isMissingDbObject(err) {
+  return /PGRST202|could not find the (function|table|view)|schema cache/i.test(describeError(err));
 }
-/* Subscription changes use security-definer functions so they work without a
-   direct write grant on nf_subscriptions. Older databases fall back to a table
-   write, which the admin policy allows. */
-async function adminSubWrite(rpcName, args, fallback, okMsg) {
-  const rpc = await sb.rpc(rpcName, args);
+/* Admin actions call a security-definer function first, so they work even when
+   the table itself only grants read access. Older databases fall back to a
+   direct write, and that write has to report the rows it changed: a silent
+   zero-row update is shown as a failure instead of a fake success. */
+async function adminRpc(name, args, fallback, okMsg) {
+  const rpc = await sb.rpc(name, args);
   if (!rpc.error) return okMsg;
-  if (!/PGRST202|could not find the function|schema cache/i.test(describeError(rpc.error))) throw rpc.error;
-  const write = await fallback();
-  if (write.error) throw write.error;
+  if (!isMissingDbObject(rpc.error)) throw rpc.error;
+  const res = await fallback();
+  if (res.error) throw res.error;
+  if (Array.isArray(res.data) && res.data.length === 0)
+    throw new Error('Nothing was saved: the database accepted the request but changed no rows. Run supabase/setup.sql in the Supabase SQL editor, then reload this page.');
   return okMsg;
 }
-/* Grant (or re-activate) a subscription. Uses the admin function when the
-   database has it, otherwise writes the row directly. */
+/* Grant (or re-activate) a subscription. */
 async function adminGrant(userId, planId, days, status) {
   const end = new Date(Date.now() + Math.max(1, days) * 864e5).toISOString();
-  const rpc = await sb.rpc('nf_admin_grant_subscription', { p_user: userId, p_plan: planId, p_days: days, p_status: status });
-  if (!rpc.error) return;
-  if (!/PGRST202|could not find the function|schema cache/i.test(describeError(rpc.error))) throw rpc.error;
-  const existing = ADMIN.subs.find(s => s.user_id === userId && s.plan_id === planId);
-  if (existing) {
-    const res = await sb.from('nf_subscriptions').update({ status, current_period_end: end, cancel_at_period_end: false }).eq('id', existing.id);
-    if (res.error) throw res.error;
-    return;
-  }
-  const ins = await sb.from('nf_subscriptions').insert({ user_id: userId, plan_id: planId, status, current_period_end: end, cancel_at_period_end: false });
-  if (ins.error) throw ins.error;
+  const fallback = async () => {
+    const existing = ADMIN.subs.find(s => s.user_id === userId && s.plan_id === planId);
+    if (existing)
+      return sb.from('nf_subscriptions').update({ status, current_period_end: end, cancel_at_period_end: false }).eq('id', existing.id).select('id');
+    return sb.from('nf_subscriptions').insert({ user_id: userId, plan_id: planId, status, current_period_end: end, cancel_at_period_end: false }).select('id');
+  };
+  await adminRpc('nf_admin_grant_subscription', { p_user: userId, p_plan: planId, p_days: days, p_status: status }, fallback, 'Subscription saved.');
 }
 
 ROUTES['/admin'] = async function pageAdmin() {
@@ -1772,16 +1770,16 @@ ROUTES['/admin'] = async function pageAdmin() {
       h('td', {}, adminPill(s.status)),
       h('td', {}, s.current_period_end ? fmtDate(s.current_period_end) : 'n/a', s.cancel_at_period_end ? h('div', { class: 'hint' }, 'cancels at period end') : null),
       h('td', {},
-        adminBtn('Activate', () => adminSubWrite('nf_admin_update_subscription', { p_id: s.id, p_status: 'active' },
-          () => sb.from('nf_subscriptions').update({ status: 'active' }).eq('id', s.id), 'Subscription activated.')),
-        adminBtn('+30 days', () => adminSubWrite('nf_admin_update_subscription', { p_id: s.id, p_add_days: 30 },
-          () => sb.from('nf_subscriptions').update({ current_period_end: new Date(base.getTime() + 30 * 864e5).toISOString() }).eq('id', s.id), 'Added 30 days.')),
-        adminBtn(s.cancel_at_period_end ? 'Undo cancel' : 'Cancel', () => adminSubWrite('nf_admin_update_subscription', { p_id: s.id, p_cancel: !s.cancel_at_period_end },
-          () => sb.from('nf_subscriptions').update({ cancel_at_period_end: !s.cancel_at_period_end }).eq('id', s.id), 'Subscription updated.')),
+        adminBtn('Activate', () => adminRpc('nf_admin_update_subscription', { p_id: s.id, p_status: 'active' },
+          () => sb.from('nf_subscriptions').update({ status: 'active' }).eq('id', s.id).select('id'), 'Subscription activated.')),
+        adminBtn('+30 days', () => adminRpc('nf_admin_update_subscription', { p_id: s.id, p_add_days: 30 },
+          () => sb.from('nf_subscriptions').update({ current_period_end: new Date(base.getTime() + 30 * 864e5).toISOString() }).eq('id', s.id).select('id'), 'Added 30 days.')),
+        adminBtn(s.cancel_at_period_end ? 'Undo cancel' : 'Cancel', () => adminRpc('nf_admin_update_subscription', { p_id: s.id, p_cancel: !s.cancel_at_period_end },
+          () => sb.from('nf_subscriptions').update({ cancel_at_period_end: !s.cancel_at_period_end }).eq('id', s.id).select('id'), 'Subscription updated.')),
         adminBtn('Delete', async () => {
           if (!confirm('Delete this subscription for ' + emailOf(s.user_id) + '? This cannot be undone.')) return false;
-          return adminSubWrite('nf_admin_delete_subscription', { p_id: s.id },
-            () => sb.from('nf_subscriptions').delete().eq('id', s.id), 'Subscription deleted.');
+          return adminRpc('nf_admin_delete_subscription', { p_id: s.id },
+            () => sb.from('nf_subscriptions').delete().eq('id', s.id).select('id'), 'Subscription deleted.');
         }, 'btn-red')));
   });
 
@@ -1792,14 +1790,14 @@ ROUTES['/admin'] = async function pageAdmin() {
       const b = ev.currentTarget, next = b.value;
       if (!confirm('Change ' + (p.email || 'this account') + ' to ' + next + '?' + (p.id === (S.session && S.session.user.id) ? ' You may lose access to this page.' : ''))) { b.value = p.role || 'customer'; return; }
       b.disabled = true;
-      try { await adminWrite(() => sb.from('nf_profiles').update({ role: next }).eq('id', p.id), 'Role updated.'); toast('Role updated.', 'ok'); await render(); }
+      try { await adminRpc('nf_admin_set_profile', { p_id: p.id, p_role: next }, () => sb.from('nf_profiles').update({ role: next }).eq('id', p.id).select('id'), 'Role updated.'); toast('Role updated.', 'ok'); await render(); }
       catch (e) { b.disabled = false; b.value = p.role || 'customer'; toast(friendlyError(e), 'bad'); }
     } }, ADMIN_ROLES.concat(['customer']).map(r => h('option', { value: r, selected: (p.role || 'customer') === r }, r)))),
     h('td', {}, adminPill(p.is_restricted ? 'suspended' : 'active'), p.is_restricted ? h('div', { class: 'hint' }, 'restricted') : null),
     h('td', {}, p.created_at ? fmtDate(p.created_at) : 'n/a'),
     h('td', {},
       adminBtn('Grant', () => { gEmail.value = p.email || ''; grantForm.scrollIntoView({ behavior: 'smooth', block: 'center' }); gEmail.focus({ preventScroll: true }); return false; }),
-      adminBtn(p.is_restricted ? 'Unrestrict' : 'Restrict', () => adminWrite(() => sb.from('nf_profiles').update({ is_restricted: !p.is_restricted }).eq('id', p.id), p.is_restricted ? 'Account unrestricted.' : 'Account restricted.')))));
+      adminBtn(p.is_restricted ? 'Unrestrict' : 'Restrict', () => adminRpc('nf_admin_set_profile', { p_id: p.id, p_restricted: !p.is_restricted }, () => sb.from('nf_profiles').update({ is_restricted: !p.is_restricted }).eq('id', p.id).select('id'), p.is_restricted ? 'Account unrestricted.' : 'Account restricted.')))));
 
   /* ---- Registrations ---- */
   const regRows = ADMIN.regs.map(r => h('tr', {},
@@ -1809,11 +1807,11 @@ ROUTES['/admin'] = async function pageAdmin() {
     h('td', {}, adminPill(r.status), r.verify_token ? h('div', { class: 'hint mono' }, r.verify_token) : null),
     h('td', {}, r.created_at ? fmtDate(r.created_at) : 'n/a'),
     h('td', {},
-      adminBtn('Approve', () => adminWrite(() => sb.from('nf_registrations').update({ status: 'active' }).eq('id', r.id), 'Registration approved.')),
-      adminBtn('Suspend', () => adminWrite(() => sb.from('nf_registrations').update({ status: 'suspended' }).eq('id', r.id), 'Registration suspended.')),
+      adminBtn('Approve', () => adminRpc('nf_admin_set_registration', { p_id: r.id, p_status: 'active' }, () => sb.from('nf_registrations').update({ status: 'active' }).eq('id', r.id).select('id'), 'Registration approved.')),
+      adminBtn('Suspend', () => adminRpc('nf_admin_set_registration', { p_id: r.id, p_status: 'suspended' }, () => sb.from('nf_registrations').update({ status: 'suspended' }).eq('id', r.id).select('id'), 'Registration suspended.')),
       adminBtn('Delete', async () => {
         if (!confirm('Delete the registration for ' + (r.identifier || r.label) + '?')) return false;
-        return adminWrite(() => sb.from('nf_registrations').delete().eq('id', r.id), 'Registration deleted.');
+        return adminRpc('nf_admin_delete_registration', { p_id: r.id }, () => sb.from('nf_registrations').delete().eq('id', r.id).select('id'), 'Registration deleted.');
       }, 'btn-red'))));
 
   /* ---- License keys ---- */
@@ -1824,10 +1822,10 @@ ROUTES['/admin'] = async function pageAdmin() {
     h('td', {}, l.max_devices != null ? String(l.max_devices) : 'n/a'),
     h('td', {}, l.created_at ? fmtDate(l.created_at) : 'n/a'),
     h('td', {},
-      adminBtn('Revoke', () => adminWrite(() => sb.from('nfa_licenses').update({ status: 'revoked' }).eq('id', l.id), 'License revoked.')),
+      adminBtn('Revoke', () => adminRpc('nf_admin_set_license', { p_id: l.id, p_status: 'revoked' }, () => sb.from('nfa_licenses').update({ status: 'revoked' }).eq('id', l.id).select('id'), 'License revoked.')),
       adminBtn('Delete', async () => {
         if (!confirm('Delete this license key?')) return false;
-        return adminWrite(() => sb.from('nfa_licenses').delete().eq('id', l.id), 'License deleted.');
+        return adminRpc('nf_admin_delete_license', { p_id: l.id }, () => sb.from('nfa_licenses').delete().eq('id', l.id).select('id'), 'License deleted.');
       }, 'btn-red'))));
 
   /* ---- Apps ---- */
@@ -1836,7 +1834,7 @@ ROUTES['/admin'] = async function pageAdmin() {
     h('td', {}, a.platform || 'windows'),
     h('td', {}, h('select', { 'aria-label': 'Status for ' + (a.name || a.key), onchange: async ev => {
       const b = ev.currentTarget; b.disabled = true;
-      try { await adminWrite(() => sb.from('nfa_apps').update({ status: b.value }).eq('key', a.key), 'App updated.'); toast('App updated.', 'ok'); await render(); }
+      try { await adminRpc('nf_admin_set_app_status', { p_key: a.key, p_status: b.value }, () => sb.from('nfa_apps').update({ status: b.value }).eq('key', a.key).select('key'), 'App updated.'); toast('App updated.', 'ok'); await render(); }
       catch (e) { b.disabled = false; toast(friendlyError(e), 'bad'); }
     } }, APP_STATUSES.map(s => h('option', { value: s, selected: (a.status || '') === s }, s.replace('_', ' '))))),
     h('td', {}, a.sort_order != null ? String(a.sort_order) : 'n/a')));
@@ -1849,9 +1847,12 @@ ROUTES['/admin'] = async function pageAdmin() {
     ev.preventDefault(); relMsg.replaceChildren();
     const btn = ev.currentTarget.querySelector('button[type=submit]'); busy(btn, true, 'Publishing…');
     try {
-      await adminWrite(() => sb.from('nfa_releases').update({ is_latest: false }).eq('app_key', rApp.value), 'Cleared older releases.');
-      const ins = await sb.from('nfa_releases').insert({ app_key: rApp.value, version: rVer.value.trim(), download_url: rUrl.value.trim(), notes: (rNotes.value || '').trim() || null, is_latest: true });
-      if (ins.error) throw ins.error;
+      await adminRpc('nf_admin_save_release', { p_app_key: rApp.value, p_version: rVer.value.trim(), p_download_url: rUrl.value.trim(), p_notes: (rNotes.value || '').trim() || null },
+        async () => {
+          const cleared = await sb.from('nfa_releases').update({ is_latest: false }).eq('app_key', rApp.value);
+          if (cleared.error) return cleared;
+          return sb.from('nfa_releases').insert({ app_key: rApp.value, version: rVer.value.trim(), download_url: rUrl.value.trim(), notes: (rNotes.value || '').trim() || null, is_latest: true }).select('id');
+        }, 'Release published.');
       toast('Release published.', 'ok'); await render();
     } catch (e) { busy(btn, false); relMsg.append(h('div', { class: 'notice bad' }, friendlyError(e))); }
   } },
@@ -1867,13 +1868,15 @@ ROUTES['/admin'] = async function pageAdmin() {
     h('td', {}, r.is_latest ? adminPill('available') : h('span', { class: 'hint' }, 'older')),
     h('td', {}, r.published_at ? fmtDate(r.published_at) : 'n/a'),
     h('td', {},
-      r.is_latest ? null : adminBtn('Make latest', async () => {
-        await adminWrite(() => sb.from('nfa_releases').update({ is_latest: false }).eq('app_key', r.app_key), 'Cleared older releases.');
-        return adminWrite(() => sb.from('nfa_releases').update({ is_latest: true }).eq('id', r.id), 'Release marked latest.');
-      }),
+      r.is_latest ? null : adminBtn('Make latest', () => adminRpc('nf_admin_mark_release', { p_id: r.id },
+        async () => {
+          const cleared = await sb.from('nfa_releases').update({ is_latest: false }).eq('app_key', r.app_key);
+          if (cleared.error) return cleared;
+          return sb.from('nfa_releases').update({ is_latest: true }).eq('id', r.id).select('id');
+        }, 'Release marked latest.')),
       adminBtn('Delete', async () => {
         if (!confirm('Delete release ' + (r.version || '') + '?')) return false;
-        return adminWrite(() => sb.from('nfa_releases').delete().eq('id', r.id), 'Release deleted.');
+        return adminRpc('nf_admin_delete_release', { p_id: r.id }, () => sb.from('nfa_releases').delete().eq('id', r.id).select('id'), 'Release deleted.');
       }, 'btn-red'))));
 
   /* ---- Service status ---- */
@@ -1881,7 +1884,7 @@ ROUTES['/admin'] = async function pageAdmin() {
     h('td', {}, h('strong', {}, r.name || r.component)),
     h('td', {}, h('select', { 'aria-label': 'Status for ' + (r.name || r.component), onchange: async ev => {
       const b = ev.currentTarget; b.disabled = true;
-      try { await adminWrite(() => sb.from('nf_service_status').update({ status: b.value, checked_at: new Date().toISOString() }).eq('component', r.component), 'Status updated.'); toast('Status updated.', 'ok'); await render(); }
+      try { await adminRpc('nf_admin_set_service_status', { p_component: r.component, p_status: b.value }, () => sb.from('nf_service_status').update({ status: b.value, checked_at: new Date().toISOString() }).eq('component', r.component).select('component'), 'Status updated.'); toast('Status updated.', 'ok'); await render(); }
       catch (e) { b.disabled = false; toast(friendlyError(e), 'bad'); }
     } }, COMPONENT_STATUSES.map(s => h('option', { value: s, selected: (r.status || '') === s }, s)))),
     h('td', {}, r.latency_ms != null ? r.latency_ms + ' ms' : 'n/a'),
