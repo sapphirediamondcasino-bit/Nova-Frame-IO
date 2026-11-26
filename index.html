@@ -693,8 +693,19 @@ function friendlyError(e) {
     return 'Cannot reach the server. In a preview window, outside connections can be blocked: open the deployed site instead. Otherwise check your internet connection.';
   if (/relation .* does not exist|42P01|PGRST202|could not find the (function|table|view)|schema cache/i.test(raw))
     return 'The database setup is incomplete. Run supabase/setup.sql in the Supabase SQL editor, then reload this page. (' + raw.slice(0, 160) + ')';
+  if (/permission denied|42501/i.test(raw))
+    return 'The database refused that action because a permission is missing. Run supabase/setup.sql in the Supabase SQL editor, then reload this page. (' + raw.slice(0, 160) + ')';
   const msg = raw.replace(/^.*?:\s*(?=[A-Z])/, '').slice(0, 240).trim();
   return msg || 'Something went wrong. Please try again.';
+}
+/* Reads the signed-in balance through the credit function when the database has
+   it, and falls back to the reporting view on older installations. */
+async function creditBalanceQuery() {
+  const rpc = await sb.rpc('nfc_credit_balance');
+  if (!rpc.error && rpc.data != null) return { data: { balance: Number(rpc.data) || 0 }, error: null };
+  if (rpc.error && !/PGRST202|could not find the function|schema cache/i.test(describeError(rpc.error)))
+    return { data: null, error: rpc.error };
+  return sb.from('nfc_credit_balances').select('balance').maybeSingle();
 }
 /* Storage that never throws (sandboxed previews, private windows, blocked cookies) */
 const memStore = new Map();
@@ -1412,7 +1423,7 @@ ROUTES['/account'] = async function pageAccount() {
     sb.from('nf_subscriptions').select('id,status,current_period_end,cancel_at_period_end,plan:nf_plans(name,billing_type,price_cents,billing_interval)')
       .eq('user_id', uid).order('created_at', { ascending: false }),
     mfaCard(),
-    sb.from('nfc_credit_balances').select('balance').maybeSingle(),
+    creditBalanceQuery(),
     sb.from('nfc_credit_ledger').select('delta,reason,job_id,created_at').order('created_at', { ascending: false }).limit(50)
   ]);
   if (subsRes.error) throw new Error(describeError(subsRes.error));
@@ -1620,7 +1631,13 @@ async function adminLoad() {
     grab('status', () => sb.from('nf_service_status').select('*').limit(200)),
     grab('discord', () => sb.from('nfb_links').select('*').limit(1000)),
     grab('discord', () => sb.from('nfb_guilds').select('*').limit(1000)),
-    grab('credits', () => sb.from('nfc_credit_balances').select('user_id,balance'))
+    grab('credits', async () => {
+      const rpc = await sb.rpc('nfc_admin_credit_balances');
+      if (!rpc.error && Array.isArray(rpc.data)) return { data: rpc.data, error: null };
+      if (rpc.error && !/PGRST202|could not find the function|schema cache/i.test(describeError(rpc.error)))
+        return { data: null, error: rpc.error };
+      return sb.from('nfc_credit_balances').select('user_id,balance');
+    })
   ]);
   Object.assign(ADMIN, { profiles, subs, plans, regs, licenses, apps, releases, status, links, guilds, credits });
   const newest = key => (a, b) => String(b[key] || '').localeCompare(String(a[key] || ''));
@@ -1664,6 +1681,17 @@ function adminBtn(label, fn, cls) {
 async function adminWrite(fn, okMsg) {
   const res = await fn();
   if (res.error) throw res.error;
+  return okMsg;
+}
+/* Subscription changes use security-definer functions so they work without a
+   direct write grant on nf_subscriptions. Older databases fall back to a table
+   write, which the admin policy allows. */
+async function adminSubWrite(rpcName, args, fallback, okMsg) {
+  const rpc = await sb.rpc(rpcName, args);
+  if (!rpc.error) return okMsg;
+  if (!/PGRST202|could not find the function|schema cache/i.test(describeError(rpc.error))) throw rpc.error;
+  const write = await fallback();
+  if (write.error) throw write.error;
   return okMsg;
 }
 /* Grant (or re-activate) a subscription. Uses the admin function when the
@@ -1744,12 +1772,16 @@ ROUTES['/admin'] = async function pageAdmin() {
       h('td', {}, adminPill(s.status)),
       h('td', {}, s.current_period_end ? fmtDate(s.current_period_end) : 'n/a', s.cancel_at_period_end ? h('div', { class: 'hint' }, 'cancels at period end') : null),
       h('td', {},
-        adminBtn('Activate', () => adminWrite(() => sb.from('nf_subscriptions').update({ status: 'active' }).eq('id', s.id), 'Subscription activated.')),
-        adminBtn('+30 days', () => adminWrite(() => sb.from('nf_subscriptions').update({ current_period_end: new Date(base.getTime() + 30 * 864e5).toISOString() }).eq('id', s.id), 'Added 30 days.')),
-        adminBtn(s.cancel_at_period_end ? 'Undo cancel' : 'Cancel', () => adminWrite(() => sb.from('nf_subscriptions').update({ cancel_at_period_end: !s.cancel_at_period_end }).eq('id', s.id), 'Subscription updated.')),
+        adminBtn('Activate', () => adminSubWrite('nf_admin_update_subscription', { p_id: s.id, p_status: 'active' },
+          () => sb.from('nf_subscriptions').update({ status: 'active' }).eq('id', s.id), 'Subscription activated.')),
+        adminBtn('+30 days', () => adminSubWrite('nf_admin_update_subscription', { p_id: s.id, p_add_days: 30 },
+          () => sb.from('nf_subscriptions').update({ current_period_end: new Date(base.getTime() + 30 * 864e5).toISOString() }).eq('id', s.id), 'Added 30 days.')),
+        adminBtn(s.cancel_at_period_end ? 'Undo cancel' : 'Cancel', () => adminSubWrite('nf_admin_update_subscription', { p_id: s.id, p_cancel: !s.cancel_at_period_end },
+          () => sb.from('nf_subscriptions').update({ cancel_at_period_end: !s.cancel_at_period_end }).eq('id', s.id), 'Subscription updated.')),
         adminBtn('Delete', async () => {
           if (!confirm('Delete this subscription for ' + emailOf(s.user_id) + '? This cannot be undone.')) return false;
-          return adminWrite(() => sb.from('nf_subscriptions').delete().eq('id', s.id), 'Subscription deleted.');
+          return adminSubWrite('nf_admin_delete_subscription', { p_id: s.id },
+            () => sb.from('nf_subscriptions').delete().eq('id', s.id), 'Subscription deleted.');
         }, 'btn-red')));
   });
 
@@ -2018,7 +2050,7 @@ async function studioLoad() {
   const [brands, projects, workflows, balance] = await Promise.all([
     brandQ, projectQ,
     sb.from('nfc_workflows').select('key,label,kind,description,credits,max_variations,requires_reference,sort_order').eq('is_active', true).order('sort_order'),
-    sb.from('nfc_credit_balances').select('balance').maybeSingle()
+    creditBalanceQuery()
   ]);
   const errors = [];
   if (WS.error) errors.push('workspaces: ' + WS.error);
