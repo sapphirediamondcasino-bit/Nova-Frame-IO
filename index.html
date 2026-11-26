@@ -691,6 +691,8 @@ function friendlyError(e) {
   const raw = describeError(e);
   if (/failed to fetch|networkerror|load failed|network request failed/i.test(raw))
     return 'Cannot reach the server. In a preview window, outside connections can be blocked: open the deployed site instead. Otherwise check your internet connection.';
+  if (/relation .* does not exist|42P01|PGRST202|could not find the (function|table|view)|schema cache/i.test(raw))
+    return 'The database setup is incomplete. Run supabase/setup.sql in the Supabase SQL editor, then reload this page. (' + raw.slice(0, 160) + ')';
   const msg = raw.replace(/^.*?:\s*(?=[A-Z])/, '').slice(0, 240).trim();
   return msg || 'Something went wrong. Please try again.';
 }
@@ -1440,7 +1442,7 @@ ROUTES['/account'] = async function pageAccount() {
     if (res.error) {
       settingsMsg.replaceChildren(h('div', { class: 'notice bad' }, friendlyError(res.error),
         /PGRST202|could not find the function/i.test(describeError(res.error))
-          ? h('p', { class: 'hint', style: 'margin-top:6px' }, 'Run supabase/preferences.sql to enable account preferences.')
+          ? h('p', { class: 'hint', style: 'margin-top:6px' }, 'Run supabase/setup.sql (the complete database setup) to enable account preferences, then reload this page.')
           : null));
       return;
     }
@@ -1640,7 +1642,7 @@ function adminNote(key) {
   const e = ADMIN.errors[key];
   if (!e) return null;
   return h('div', { class: 'notice bad' }, h('strong', {}, 'This section could not load. '), e,
-    h('p', { class: 'hint', style: 'margin-top:8px' }, 'Run supabase/admin-panel.sql in the Supabase SQL editor, then reload this page.'));
+    h('p', { class: 'hint', style: 'margin-top:8px' }, 'Run supabase/setup.sql in the Supabase SQL editor, then reload this page. If you already ran it, check the SQL editor for the first error.'));
 }
 function adminTable(headers, rows) {
   return h('div', { class: 'card', style: 'padding:8px 12px;overflow-x:auto' },
@@ -2677,11 +2679,11 @@ ROUTES['/workspace'] = async function pageWorkspace() {
   if (WS.error) return h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('h1', {}, 'Workspace')),
     h('div', { class: 'notice bad', role: 'alert' }, h('strong', {}, 'Workspaces are not available yet. '), WS.error,
-      h('p', { class: 'hint', style: 'margin-top:6px' }, 'Run supabase/workspace.sql in the Supabase SQL editor, then reload this page.'),
+      h('p', { class: 'hint', style: 'margin-top:6px' }, 'Run supabase/setup.sql in the Supabase SQL editor, then reload this page. If you already ran it, check the SQL editor for the first error.'),
       h('a', { class: 'btn btn-ghost btn-sm', href: '#/studio', style: 'margin-top:10px' }, 'Back to studio')));
   if (!WS.id) return h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('h1', {}, 'Workspace')),
-    h('div', { class: 'notice bad' }, 'No workspace was found for your account. Run supabase/workspace.sql, then reload.'));
+    h('div', { class: 'notice bad' }, 'No workspace was found for your account. Run supabase/setup.sql, then reload. Existing projects and brands are attached automatically.'));
 
   const [members, brands] = await Promise.all([
     sb.rpc('nf_workspace_members_list', { p_workspace: WS.id }),
@@ -3241,7 +3243,7 @@ ROUTES['/library'] = async function pageLibrary() {
   if (LIB.error && !LIB.assets.length) return h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('h1', {}, 'Asset library')),
     h('div', { class: 'notice bad', role: 'alert' }, h('strong', {}, 'The library could not be loaded. '), LIB.error,
-      h('p', { class: 'hint', style: 'margin-top:6px' }, 'If this is a new deployment, run supabase/library.sql and reload.'),
+      h('p', { class: 'hint', style: 'margin-top:6px' }, 'Run supabase/setup.sql in the Supabase SQL editor, then reload. If you already ran it, check the SQL editor for the first error.'),
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', style: 'margin-top:10px', onclick: () => render() }, 'Try again')));
 
   const grid = h('div', { id: 'libGrid', class: 'grid grid-2', 'aria-live': 'polite' });
